@@ -178,7 +178,6 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom.py
 ├── exploit.py               ← GDB 輔助單漏洞 RCE（詳見 gdb-exploit.md）
 ├── README.md                ← 本文件（HTTP 雙漏洞路線）
 ├── gdb-exploit.md           ← GDB 單漏洞路線：記憶體位址解析與 payload 佈局
-├── RESULTS.md               ← 實機測試結果
 ```
 
 ## 限制
