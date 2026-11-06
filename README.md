@@ -100,13 +100,26 @@ session.use_strict_mode = 0   ; 預設接受任意 session ID
 
 ## 腳本說明
 
-| 腳本 | 路線 | CVE | 前置條件 | 說明 |
-|------|------|-----|----------|------|
-| `exploit_lfi.py` | OOM + LFI | 619 | 目標存在 LFI 漏洞 | 純 HTTP 雙漏洞，不需記憶體位址 |
-| `http_rce.py` | OOM + auto_prepend | 619 | `.htaccess` 已放置，`post_max_size ≥ memory_limit` | 純 HTTP 雙漏洞，`.htaccess` 設定 `auto_prepend_file` |
-| `http_rce_default.py` | OOM + auto_prepend | 619 | `.htaccess` 已放置，Apache AllowOverride All | 純 HTTP 雙漏洞，`.htaccess` 覆蓋所有設定 |
-| `test_oom.py` | 僅 OOM 測試 | 619 | `post_max_size ≥ memory_limit` | 只驗證 OOM 是否觸發 |
-| `exploit.py` | GDB 記憶體劫持 | 619 | SSH + GDB + debug symbols | 單漏洞，詳見 [gdb-exploit.md](gdb-exploit.md) |
+四個 RCE 腳本的差別在於**怎麼讓 PHP include session 檔**：
+
+| 腳本 | include 方式 | php.ini 要求 | 前置條件 |
+|------|-------------|-------------|----------|
+| `test_lfi.py` | 目標本身的 **LFI 漏洞**（如 `?file=`） | `post_max_size ≥ memory_limit` | 目標存在 LFI 向量 |
+| `http_exploit.py` | `.htaccess` 的 **auto_prepend_file** | `post_max_size ≥ memory_limit` | `.htaccess` 已放置 |
+| `http_default_exploit.py` | `.htaccess` 的 **auto_prepend_file** | **stock 預設即可** | `.htaccess` 已放置，Apache AllowOverride All |
+| `test_gdb.py` | GDB 直接**劫持記憶體** | 不限 | SSH + GDB + debug symbols |
+
+- `test_lfi.py` — 靠目標已有的 LFI 漏洞去 include session 檔，不需要 .htaccess
+- `http_exploit.py` — 靠 .htaccess 設定 auto_prepend_file，但 php.ini 要先調過（`post_max_size ≥ memory_limit`）
+- `http_default_exploit.py` — 靠 .htaccess 同時覆蓋 memory_limit 和 post_max_size，php.ini 維持預設就能打
+- `test_gdb.py` — 不走 HTTP include，而是 SSH 進主機用 GNU Debugger 直接改記憶體，詳見 [gdb-exploit.md](gdb-exploit.md)
+
+輔助工具：
+
+| 腳本 | 說明 |
+|------|------|
+| `test_oom.py` | 只驗證 OOM 是否能觸發，不嘗試 RCE |
+| `uaf_rce.py` | Heap UAF spray 實驗腳本（理論未驗證，見下方說明） |
 
 ### 方式一：OOM + LFI（純 HTTP）
 
@@ -118,7 +131,7 @@ session.use_strict_mode = 0   ; 預設接受任意 session ID
 ```
 
 ```bash
-TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 exploit_lfi.py
+TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_lfi.py
 ```
 
 ### 方式二：OOM + .htaccess auto_prepend_file（純 HTTP）
@@ -134,12 +147,12 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 exploit_lfi.py
 
 目標 php.ini 已調整過（`post_max_size > memory_limit`）：
 ```bash
-TARGET_HOST=10.0.0.1 python3 http_rce.py
+TARGET_HOST=10.0.0.1 python3 http_exploit.py
 ```
 
 目標為 stock php.ini（`.htaccess` 同時覆蓋 memory_limit 和 post_max_size）：
 ```bash
-TARGET_HOST=10.0.0.1 python3 http_rce_default.py
+TARGET_HOST=10.0.0.1 python3 http_default_exploit.py
 ```
 
 ### OOM 獨立測試
@@ -178,21 +191,22 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom.py
 ## 檔案結構
 
 ```
-├── exploit_lfi.py           ← 純 HTTP 雙漏洞 RCE（OOM + LFI，619）
-├── http_rce.py              ← 純 HTTP 雙漏洞 RCE（OOM + auto_prepend_file，619）
-├── http_rce_default.py      ← 純 HTTP 雙漏洞 RCE（stock php.ini + .htaccess，619）
-├── test_oom.py              ← 獨立 OOM 觸發測試（619）
-├── exploit.py               ← GDB 輔助單漏洞 RCE（619，詳見 gdb-exploit.md）
+├── test_lfi.py              ← OOM + LFI include → RCE
+├── http_exploit.py          ← OOM + .htaccess auto_prepend → RCE（需調 php.ini）
+├── http_default_exploit.py  ← OOM + .htaccess auto_prepend → RCE（stock php.ini）
+├── test_oom.py              ← 獨立 OOM 觸發測試
+├── test_gdb.py              ← GDB 輔助記憶體劫持 → RCE（詳見 gdb-exploit.md）
+├── uaf_rce.py               ← Heap UAF spray 實驗腳本（理論未驗證）
 ├── README.md                ← 本文件
 ├── gdb-exploit.md           ← GDB 單漏洞路線：記憶體位址解析與 payload 佈局
 ```
 
 ## 限制
 
-- **LFI 版本** (`exploit_lfi.py`)：需要目標存在 LFI 向量
-- **.htaccess 版本** (`http_rce.py`, `http_rce_default.py`)：需要 `.htaccess` 已在 web root（任何寫入方式皆可）
+- **LFI 版本** (`test_lfi.py`)：需要目標存在 LFI 向量
+- **.htaccess 版本** (`http_exploit.py`, `http_default_exploit.py`)：需要 `.htaccess` 已在 web root（任何寫入方式皆可）
 - **PHP 預設設定下無法單獨觸發 OOM**：需要 `post_max_size ≥ memory_limit`
-- **GDB 版本** (`exploit.py`)：需要 SSH + sudo + debug symbols，詳見 [gdb-exploit.md](gdb-exploit.md)
+- **GDB 版本** (`test_gdb.py`)：需要 SSH + sudo + debug symbols，詳見 [gdb-exploit.md](gdb-exploit.md)
 
 ## 相關 CVE
 
