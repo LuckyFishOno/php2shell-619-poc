@@ -100,13 +100,14 @@ session.use_strict_mode = 0   ; 預設接受任意 session ID
 
 ## 腳本說明
 
-| 腳本 | 路線 | 前置條件 | 說明 |
-|------|------|----------|------|
-| `exploit_lfi.py` | OOM + LFI | 目標存在 LFI 漏洞 | 純 HTTP，不需任何主機存取 |
-| `http_rce.py` | OOM + auto_prepend | `.htaccess` 已放置，`post_max_size ≥ memory_limit` | 純 HTTP，`.htaccess` 設定 `auto_prepend_file` 指向 session 檔 |
-| `http_rce_default.py` | OOM + auto_prepend | `.htaccess` 已放置，Apache AllowOverride All | 純 HTTP，`.htaccess` 同時覆蓋 `memory_limit` + `post_max_size` + `auto_prepend_file` |
-| `test_oom.py` | 僅 OOM 測試 | `post_max_size ≥ memory_limit` | 只驗證 OOM 是否觸發，不嘗試 RCE |
-| `exploit.py` | GDB 記憶體劫持 | SSH + GDB + debug symbols | 單漏洞路線，詳見 [gdb-exploit.md](gdb-exploit.md) |
+| 腳本 | 路線 | CVE | 前置條件 | 說明 |
+|------|------|-----|----------|------|
+| `uaf_rce.py` | **Heap UAF spray** | 618 / 619 | `zval_ptr_dtor` 位址 | **純 HTTP 單漏洞 RCE**，stock php.ini，不需 LFI/.htaccess/SSH |
+| `exploit_lfi.py` | OOM + LFI | 619 | 目標存在 LFI 漏洞 | 純 HTTP 雙漏洞，不需記憶體位址 |
+| `http_rce.py` | OOM + auto_prepend | 619 | `.htaccess` 已放置，`post_max_size ≥ memory_limit` | 純 HTTP 雙漏洞，`.htaccess` 設定 `auto_prepend_file` |
+| `http_rce_default.py` | OOM + auto_prepend | 619 | `.htaccess` 已放置，Apache AllowOverride All | 純 HTTP 雙漏洞，`.htaccess` 覆蓋所有設定 |
+| `test_oom.py` | 僅 OOM 測試 | 619 | `post_max_size ≥ memory_limit` | 只驗證 OOM 是否觸發 |
+| `exploit.py` | GDB 記憶體劫持 | 619 | SSH + GDB + debug symbols | 單漏洞，詳見 [gdb-exploit.md](gdb-exploit.md) |
 
 ### 方式一：OOM + LFI（純 HTTP）
 
@@ -178,12 +179,13 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom.py
 ## 檔案結構
 
 ```
-├── exploit_lfi.py           ← 純 HTTP RCE（OOM + LFI）
-├── http_rce.py              ← 純 HTTP RCE（OOM + auto_prepend_file）
-├── http_rce_default.py      ← 純 HTTP RCE（stock php.ini + .htaccess override）
-├── test_oom.py              ← 獨立 OOM 觸發測試
-├── exploit.py               ← GDB 輔助單漏洞 RCE（詳見 gdb-exploit.md）
-├── README.md                ← 本文件（HTTP 雙漏洞路線）
+├── uaf_rce.py               ← 純 HTTP 單漏洞 RCE（Heap UAF spray，618/619）
+├── exploit_lfi.py           ← 純 HTTP 雙漏洞 RCE（OOM + LFI，619）
+├── http_rce.py              ← 純 HTTP 雙漏洞 RCE（OOM + auto_prepend_file，619）
+├── http_rce_default.py      ← 純 HTTP 雙漏洞 RCE（stock php.ini + .htaccess，619）
+├── test_oom.py              ← 獨立 OOM 觸發測試（619）
+├── exploit.py               ← GDB 輔助單漏洞 RCE（619，詳見 gdb-exploit.md）
+├── README.md                ← 本文件
 ├── gdb-exploit.md           ← GDB 單漏洞路線：記憶體位址解析與 payload 佈局
 ```
 
@@ -197,3 +199,10 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom.py
 ## 相關 CVE
 
 - **CVE-2026-109619**：PHP Session Upload Progress OOM → session file preservation
+  - stale 內層指標 `current_file_bytes_processed`（單檔分塊觸發）
+  - 本 repo 的 OOM 路線（雙漏洞）和 GDB 路線皆基於此變體
+- **CVE-2026-109618**：PHP Session Upload Progress Heap UAF → RCE
+  - stale 外層指標 `post_bytes_processed`（多檔上傳觸發）
+  - `uaf_rce.py` 支援此變體（`--bug 618`，預設）
+- 兩者皆在 PHP 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 修補（2026-10-21）
+- PHP 7.x 無官方修補
