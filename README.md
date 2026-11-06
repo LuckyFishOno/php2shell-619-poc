@@ -51,9 +51,9 @@ OOM 觸發的必要條件：`post_max_size ≥ memory_limit`
 
 | 腳本 | 路線 | 前置條件 | 說明 |
 |------|------|----------|------|
-| `test_lfi.py` | OOM + LFI | 目標存在 LFI 漏洞 | 純 HTTP 雙漏洞，不需記憶體位址 |
-| `http_exploit.py` | OOM + auto_prepend | `.htaccess` 已放置，`post_max_size ≥ memory_limit` | `.htaccess` 設定 `auto_prepend_file` |
-| `http_default_exploit.py` | OOM + auto_prepend | `.htaccess` 已放置，Apache AllowOverride All | `.htaccess` 覆蓋所有設定，stock php.ini 即可 |
+| `php2shell.py` | OOM + LFI | 目標存在 LFI 漏洞 | 純 HTTP 雙漏洞，不需記憶體位址 |
+| `test_http.py` | OOM + auto_prepend | `.htaccess` 已放置，`post_max_size ≥ memory_limit` | `.htaccess` 設定 `auto_prepend_file` |
+| `test_default_http.py` | OOM + auto_prepend | `.htaccess` 已放置，Apache AllowOverride All | `.htaccess` 覆蓋所有設定，stock php.ini 即可 |
 | `test_oom.py` | 僅 OOM 測試 | `post_max_size ≥ memory_limit` | 只驗證 OOM 是否觸發 |
 | `test_gdb.py` | GDB 記憶體劫持 | SSH + GDB + debug symbols | 單漏洞，詳見 [gdb-exploit.md](gdb-exploit.md) |
 | `uaf_rce.py` | Heap UAF spray | — | 實驗腳本（理論未驗證） |
@@ -68,7 +68,7 @@ OOM 觸發的必要條件：`post_max_size ≥ memory_limit`
 ```
 
 ```bash
-TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_lfi.py
+TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 php2shell.py
 ```
 
 ### OOM + .htaccess auto_prepend_file
@@ -81,12 +81,12 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_lfi.py
 
 php.ini 已調整（`post_max_size > memory_limit`）：
 ```bash
-TARGET_HOST=10.0.0.1 python3 http_exploit.py
+TARGET_HOST=10.0.0.1 python3 test_http.py
 ```
 
 stock php.ini（`.htaccess` 同時覆蓋 memory_limit 和 post_max_size）：
 ```bash
-TARGET_HOST=10.0.0.1 python3 http_default_exploit.py
+TARGET_HOST=10.0.0.1 python3 test_default_http.py
 ```
 
 ## 環境變數
@@ -103,9 +103,9 @@ Session 路徑因發行版不同：Debian/Ubuntu `/var/lib/php/sessions/`、Cent
 ## 檔案結構
 
 ```
-├── test_lfi.py              ← OOM + LFI → RCE
-├── http_exploit.py          ← OOM + .htaccess → RCE（需調 php.ini）
-├── http_default_exploit.py  ← OOM + .htaccess → RCE（stock php.ini）
+├── php2shell.py             ← OOM + LFI → RCE
+├── test_http.py             ← OOM + .htaccess → RCE（需調 php.ini）
+├── test_default_http.py     ← OOM + .htaccess → RCE（stock php.ini）
 ├── test_oom.py              ← OOM 觸發測試
 ├── test_gdb.py              ← GDB 記憶體劫持 → RCE
 ├── uaf_rce.py               ← Heap UAF spray（理論未驗證）
@@ -116,7 +116,7 @@ Session 路徑因發行版不同：Debian/Ubuntu `/var/lib/php/sessions/`、Cent
 
 ## 限制
 
-- LFI 版本需要目標存在 LFI 向量
-- .htaccess 版本需要 `.htaccess` 已在 web root 且 Apache AllowOverride All
+- LFI 版本（`php2shell.py`）需要目標存在 LFI 向量
+- .htaccess 版本（`test_http.py`, `test_default_http.py`）需要 `.htaccess` 已在 web root 且 Apache AllowOverride All
 - PHP 預設設定下無法單獨觸發 OOM，需要 `post_max_size ≥ memory_limit`
 - GDB 版本需要 SSH + sudo + debug symbols

