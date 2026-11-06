@@ -4,7 +4,7 @@
 在 session 檔案中保留攻擊者控制的 PHP 程式碼，再搭配第二個漏洞（LFI 或 .htaccess 寫入）
 將 session 檔案包含執行，達成遠端程式碼執行。
 
-**已在兩個完全不同的環境上驗證成功：**
+已在兩個完全不同的環境上驗證成功：
 
 | | Target A | Target B |
 |---|---|---|
@@ -16,104 +16,51 @@
 | 包含方式 | `.htaccess` auto_prepend_file | LFI (reader.php) |
 | 結果 | `uid=33(www-data)` | `uid=48(apache)` |
 
-> 同一個 OOM 原語，不需要任何記憶體位址、不需要 GDB、不需要 debug symbols，
-> 跨 PHP 7.x / 8.x、跨作業系統皆可觸發。
->
-> 單漏洞驗證路線（透過 GDB 直接劫持記憶體達成 RCE）請參考 [gdb-exploit.md](gdb-exploit.md)。
->
-> OOM 原語的技術細節（session upload progress 機制、sapi_activate 中斷路徑、session 檔案格式）請參考 [oom-exploit.md](oom-exploit.md)。
+同一個 OOM 原語，不需要任何記憶體位址、不需要 GDB、不需要 debug symbols，
+跨 PHP 7.x / 8.x、跨作業系統皆可觸發。
+
+在 PHP 8.4.27 / 8.3.36 / 8.2.35 修補（2026-10-21），PHP 7.x 無官方修補。
 
 ## 漏洞原理
 
 ```
 攻擊者 ──POST──▶ PHP (multipart + session upload progress)
                   │
-                  ├─ PHP 在 filename 中記錄 session upload progress
+                  ├─ filename 中的 PHP 程式碼寫入 session 檔案
                   ├─ POST body 超過 memory_limit → OOM
-                  ├─ OOM 阻止 session RSHUTDOWN 執行
-                  └─ session 檔案保留在磁碟上，內含 filename 中的 PHP 程式碼
-                  
-攻擊者 ──GET───▶ 第二個漏洞 include session 檔案
+                  ├─ OOM 阻止 session RSHUTDOWN → 檔案不被清除
                   │
-                  └─ PHP parser 解析到 <?php 標籤 → 執行任意指令 → RCE
+攻擊者 ──GET───▶ 第二個漏洞 include session 檔案 → RCE
 ```
 
-### 關鍵機制
+1. PHP 處理 multipart 上傳時，將 filename 原樣寫入 session 檔案（session upload progress）
+2. POST body 超過 `memory_limit` → OOM 發生在 `sapi_activate()` 階段，session RSHUTDOWN 不執行
+3. session 檔案保留在磁碟上，PHP parser 遇到 `<?php` 標籤直接執行
 
-1. **Session Upload Progress**：PHP 處理 multipart 上傳時，會將上傳進度（包含 filename）
-   寫入 session 檔案。攻擊者將 PHP 程式碼放在 filename 中。
+OOM 觸發的必要條件：`post_max_size ≥ memory_limit`
 
-2. **OOM 阻止清理**：當 POST body 大小超過 `memory_limit`，PHP 觸發 Fatal Error。
-   OOM 發生在 `sapi_activate()` 階段，`zend_activate_modules()`（RINIT）永不執行，
-   因此 session 的 RSHUTDOWN 也不執行 — session 檔案不會被刪除。
+| 設定 | OOM |
+|------|:---:|
+| `post_max_size=8M`, `memory_limit=128M`（PHP 預設） | ✗ |
+| `post_max_size=256M`, `memory_limit=128M`（管理員調高） | ✓ |
+| `.htaccess` 覆蓋 memory_limit / post_max_size | ✓ |
 
-3. **Session 檔案格式**：保留的 session 檔案是 PHP 序列化格式，
-   PHP parser 在遇到 `<?php` 標籤時會直接執行其後的程式碼，
-   無論前後有多少序列化資料。
-
-## post_max_size 與 memory_limit 的關係
-
-OOM 觸發的**必要條件**：
-
-```
-post_max_size ≥ memory_limit
-```
-
-| 設定 | 預設值 | OOM 可否觸發 |
-|------|--------|:----------:|
-| `post_max_size=8M`, `memory_limit=128M` | PHP 預設 | ✗ 不可能 |
-| `post_max_size=256M`, `memory_limit=128M` | 調高 post_max_size | ✓ |
-| `post_max_size=8M`, `memory_limit=8M` | .htaccess 降低 memory_limit | ✓ |
-
-**原理**：PHP 在 `sapi_read_post_data()` 階段處理 POST body，但最多只處理
-`post_max_size` 大小的資料。若 `post_max_size < memory_limit`，無論攻擊者
-傳送多大的 body，PHP 分配的記憶體永遠不會超過 `memory_limit`，OOM 無法觸發。
-
-> Apache 本身會接受任何大小的 request body（已測試 1.2GB 通過），
-> 但 PHP 層只處理 `post_max_size` 以內的部分。
-
-### 現實場景的攻擊條件
-
-1. **管理員調高 post_max_size**（如 WordPress 允許大檔案上傳，設為 64M / 128M / 256M）
-   → POST body 超過 memory_limit → OOM
-2. **AllowOverride All + .htaccess 寫入** → `.htaccess` 設定
-   `php_value memory_limit 8M` + `php_value post_max_size 256M` → OOM
-3. **PHP 預設** (`post_max_size=8M`, `memory_limit=128M`) → **無法觸發**
-
-### PHP 預設設定參考
-
-```ini
-; PHP 預設值（所有版本）
-memory_limit = 128M          ; 單一腳本可用記憶體上限
-post_max_size = 8M           ; PHP 處理的 POST 資料上限
-upload_max_filesize = 2M     ; 單一上傳檔案大小上限
-max_file_uploads = 20        ; 同時上傳檔案數上限
-
-; Session Upload Progress（預設全部啟用）
-session.upload_progress.enabled = On
-session.upload_progress.cleanup = On
-session.upload_progress.prefix = "upload_progress_"
-session.upload_progress.name = "PHP_SESSION_UPLOAD_PROGRESS"
-
-; Session Cookie
-session.use_only_cookies = 1  ; 預設只接受 cookie 傳遞 PHPSESSID
-session.use_strict_mode = 0   ; 預設接受任意 session ID
-```
+技術細節（sapi_activate 中斷路徑、session 寫入機制、檔案格式）→ [oom-exploit.md](oom-exploit.md)
 
 ## 腳本說明
 
 | 腳本 | 路線 | 前置條件 | 說明 |
 |------|------|----------|------|
 | `test_lfi.py` | OOM + LFI | 目標存在 LFI 漏洞 | 純 HTTP 雙漏洞，不需記憶體位址 |
-| `http_exploit.py` | OOM + auto_prepend | `.htaccess` 已放置，`post_max_size ≥ memory_limit` | 純 HTTP 雙漏洞，`.htaccess` 設定 `auto_prepend_file` |
-| `http_default_exploit.py` | OOM + auto_prepend | `.htaccess` 已放置，Apache AllowOverride All | 純 HTTP 雙漏洞，`.htaccess` 覆蓋所有設定 |
-| `test_oom.py` | 僅 OOM 測試 | `post_max_size ≥ memory_limit` | 只驗證 OOM 是否觸發，詳見 [oom-exploit.md](oom-exploit.md) |
+| `http_exploit.py` | OOM + auto_prepend | `.htaccess` 已放置，`post_max_size ≥ memory_limit` | `.htaccess` 設定 `auto_prepend_file` |
+| `http_default_exploit.py` | OOM + auto_prepend | `.htaccess` 已放置，Apache AllowOverride All | `.htaccess` 覆蓋所有設定，stock php.ini 即可 |
+| `test_oom.py` | 僅 OOM 測試 | `post_max_size ≥ memory_limit` | 只驗證 OOM 是否觸發 |
 | `test_gdb.py` | GDB 記憶體劫持 | SSH + GDB + debug symbols | 單漏洞，詳見 [gdb-exploit.md](gdb-exploit.md) |
 | `uaf_rce.py` | Heap UAF spray | — | 實驗腳本（理論未驗證） |
 
-### 方式一：OOM + LFI（純 HTTP）
+## 使用方式
 
-適用於目標存在 Local File Inclusion 漏洞的環境。
+### OOM + LFI
 
 ```
 1. POST multipart → OOM → session 檔案保留（含 PHP code）
@@ -124,10 +71,7 @@ session.use_strict_mode = 0   ; 預設接受任意 session ID
 TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_lfi.py
 ```
 
-### 方式二：OOM + .htaccess auto_prepend_file（純 HTTP）
-
-適用於目標 web root 已有 `.htaccess`（管理員設定、檔案上傳漏洞、或其他寫入方式）
-且 Apache 設定 AllowOverride All 的環境。
+### OOM + .htaccess auto_prepend_file
 
 ```
 1. .htaccess 設定 auto_prepend_file 指向 session 檔案（事先放置）
@@ -135,27 +79,17 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_lfi.py
 3. GET /any.php → Apache 自動 prepend session 檔案 → RCE
 ```
 
-目標 php.ini 已調整過（`post_max_size > memory_limit`）：
+php.ini 已調整（`post_max_size > memory_limit`）：
 ```bash
 TARGET_HOST=10.0.0.1 python3 http_exploit.py
 ```
 
-目標為 stock php.ini（`.htaccess` 同時覆蓋 memory_limit 和 post_max_size）：
+stock php.ini（`.htaccess` 同時覆蓋 memory_limit 和 post_max_size）：
 ```bash
 TARGET_HOST=10.0.0.1 python3 http_default_exploit.py
 ```
 
-### OOM 獨立測試
-
-只測試 OOM 是否能觸發（不嘗試 RCE）：
-
-```bash
-TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom.py
-```
-
 ## 環境變數
-
-所有腳本使用環境變數取代硬編碼的主機資訊：
 
 | 變數 | 預設值 | 說明 |
 |------|--------|------|
@@ -164,45 +98,25 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom.py
 | `SESSION_PATH` | `/var/lib/php/sessions` | Session 檔案目錄 |
 | `CMD` | `id` | 要執行的指令 |
 
-## Session 檔案路徑
-
-不同發行版的 session 儲存路徑不同：
-
-| 發行版 | 路徑 |
-|--------|------|
-| Debian / Ubuntu | `/var/lib/php/sessions/` |
-| CentOS / RHEL | `/var/lib/php/session/` |
-| 通用 fallback | `/tmp/` |
-| 自訂 | `php.ini` 的 `session.save_path` |
-
-> `phpinfo()` 顯示 `session.save_path` 為 "no value" 時，
-> 實際路徑由編譯時預設決定，不一定是 `/tmp/`。
+Session 路徑因發行版不同：Debian/Ubuntu `/var/lib/php/sessions/`、CentOS/RHEL `/var/lib/php/session/`、fallback `/tmp/`。
 
 ## 檔案結構
 
 ```
-├── test_lfi.py              ← OOM + LFI include → RCE
-├── http_exploit.py          ← OOM + .htaccess auto_prepend → RCE（需調 php.ini）
-├── http_default_exploit.py  ← OOM + .htaccess auto_prepend → RCE（stock php.ini）
-├── test_oom.py              ← 獨立 OOM 觸發測試
-├── test_gdb.py              ← GDB 輔助記憶體劫持 → RCE（詳見 gdb-exploit.md）
-├── uaf_rce.py               ← Heap UAF spray 實驗腳本（理論未驗證）
-├── README.md                ← 本文件
-├── oom-exploit.md           ← OOM 原語技術細節：session upload progress 與 sapi_activate 中斷
-├── gdb-exploit.md           ← GDB 單漏洞路線：記憶體位址解析與 payload 佈局
+├── test_lfi.py              ← OOM + LFI → RCE
+├── http_exploit.py          ← OOM + .htaccess → RCE（需調 php.ini）
+├── http_default_exploit.py  ← OOM + .htaccess → RCE（stock php.ini）
+├── test_oom.py              ← OOM 觸發測試
+├── test_gdb.py              ← GDB 記憶體劫持 → RCE
+├── uaf_rce.py               ← Heap UAF spray（理論未驗證）
+├── README.md
+├── oom-exploit.md           ← OOM 技術細節
+├── gdb-exploit.md           ← GDB 路線技術細節
 ```
 
 ## 限制
 
-- **LFI 版本** (`test_lfi.py`)：需要目標存在 LFI 向量
-- **.htaccess 版本** (`http_exploit.py`, `http_default_exploit.py`)：需要 `.htaccess` 已在 web root（任何寫入方式皆可）
-- **PHP 預設設定下無法單獨觸發 OOM**：需要 `post_max_size ≥ memory_limit`
-- **GDB 版本** (`test_gdb.py`)：需要 SSH + sudo + debug symbols，詳見 [gdb-exploit.md](gdb-exploit.md)
-
-## 相關 CVE
-
-- **CVE-2026-109619**：PHP Session Upload Progress OOM → session file preservation
-  - stale 內層指標 `current_file_bytes_processed`（單檔分塊觸發）
-  - 本 repo 的 OOM 路線（雙漏洞）和 GDB 路線皆基於此變體
-- 在 PHP 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 修補（2026-10-21）
-- PHP 7.x 無官方修補
+- LFI 版本需要目標存在 LFI 向量
+- .htaccess 版本需要 `.htaccess` 已在 web root 且 Apache AllowOverride All
+- PHP 預設設定下無法單獨觸發 OOM，需要 `post_max_size ≥ memory_limit`
+- GDB 版本需要 SSH + sudo + debug symbols
