@@ -20,6 +20,8 @@
 > 跨 PHP 7.x / 8.x、跨作業系統皆可觸發。
 >
 > 單漏洞驗證路線（透過 GDB 直接劫持記憶體達成 RCE）請參考 [gdb-exploit.md](gdb-exploit.md)。
+>
+> OOM 原語的技術細節（session upload progress 機制、sapi_activate 中斷路徑、session 檔案格式）請參考 [oom-exploit.md](oom-exploit.md)。
 
 ## 漏洞原理
 
@@ -100,26 +102,14 @@ session.use_strict_mode = 0   ; 預設接受任意 session ID
 
 ## 腳本說明
 
-四個 RCE 腳本的差別在於**怎麼讓 PHP include session 檔**：
-
-| 腳本 | include 方式 | php.ini 要求 | 前置條件 |
-|------|-------------|-------------|----------|
-| `test_lfi.py` | 目標本身的 **LFI 漏洞**（如 `?file=`） | `post_max_size ≥ memory_limit` | 目標存在 LFI 向量 |
-| `http_exploit.py` | `.htaccess` 的 **auto_prepend_file** | `post_max_size ≥ memory_limit` | `.htaccess` 已放置 |
-| `http_default_exploit.py` | `.htaccess` 的 **auto_prepend_file** | **stock 預設即可** | `.htaccess` 已放置，Apache AllowOverride All |
-| `test_gdb.py` | GDB 直接**劫持記憶體** | 不限 | SSH + GDB + debug symbols |
-
-- `test_lfi.py` — 靠目標已有的 LFI 漏洞去 include session 檔，不需要 .htaccess
-- `http_exploit.py` — 靠 .htaccess 設定 auto_prepend_file，但 php.ini 要先調過（`post_max_size ≥ memory_limit`）
-- `http_default_exploit.py` — 靠 .htaccess 同時覆蓋 memory_limit 和 post_max_size，php.ini 維持預設就能打
-- `test_gdb.py` — 不走 HTTP include，而是 SSH 進主機用 GNU Debugger 直接改記憶體，詳見 [gdb-exploit.md](gdb-exploit.md)
-
-輔助工具：
-
-| 腳本 | 說明 |
-|------|------|
-| `test_oom.py` | 只驗證 OOM 是否能觸發，不嘗試 RCE |
-| `uaf_rce.py` | Heap UAF spray 實驗腳本（理論未驗證，見下方說明） |
+| 腳本 | 路線 | 前置條件 | 說明 |
+|------|------|----------|------|
+| `test_lfi.py` | OOM + LFI | 目標存在 LFI 漏洞 | 純 HTTP 雙漏洞，不需記憶體位址 |
+| `http_exploit.py` | OOM + auto_prepend | `.htaccess` 已放置，`post_max_size ≥ memory_limit` | 純 HTTP 雙漏洞，`.htaccess` 設定 `auto_prepend_file` |
+| `http_default_exploit.py` | OOM + auto_prepend | `.htaccess` 已放置，Apache AllowOverride All | 純 HTTP 雙漏洞，`.htaccess` 覆蓋所有設定 |
+| `test_oom.py` | 僅 OOM 測試 | `post_max_size ≥ memory_limit` | 只驗證 OOM 是否觸發，詳見 [oom-exploit.md](oom-exploit.md) |
+| `test_gdb.py` | GDB 記憶體劫持 | SSH + GDB + debug symbols | 單漏洞，詳見 [gdb-exploit.md](gdb-exploit.md) |
+| `uaf_rce.py` | Heap UAF spray | — | 實驗腳本（理論未驗證） |
 
 ### 方式一：OOM + LFI（純 HTTP）
 
@@ -198,6 +188,7 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom.py
 ├── test_gdb.py              ← GDB 輔助記憶體劫持 → RCE（詳見 gdb-exploit.md）
 ├── uaf_rce.py               ← Heap UAF spray 實驗腳本（理論未驗證）
 ├── README.md                ← 本文件
+├── oom-exploit.md           ← OOM 原語技術細節：session upload progress 與 sapi_activate 中斷
 ├── gdb-exploit.md           ← GDB 單漏洞路線：記憶體位址解析與 payload 佈局
 ```
 
