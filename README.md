@@ -102,7 +102,6 @@ session.use_strict_mode = 0   ; 預設接受任意 session ID
 
 | 腳本 | 路線 | CVE | 前置條件 | 說明 |
 |------|------|-----|----------|------|
-| `uaf_rce.py` | **Heap UAF spray** | 618 / 619 | `zval_ptr_dtor` 位址 | **純 HTTP 單漏洞 RCE**，stock php.ini，不需 LFI/.htaccess/SSH |
 | `exploit_lfi.py` | OOM + LFI | 619 | 目標存在 LFI 漏洞 | 純 HTTP 雙漏洞，不需記憶體位址 |
 | `http_rce.py` | OOM + auto_prepend | 619 | `.htaccess` 已放置，`post_max_size ≥ memory_limit` | 純 HTTP 雙漏洞，`.htaccess` 設定 `auto_prepend_file` |
 | `http_rce_default.py` | OOM + auto_prepend | 619 | `.htaccess` 已放置，Apache AllowOverride All | 純 HTTP 雙漏洞，`.htaccess` 覆蓋所有設定 |
@@ -179,7 +178,6 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom.py
 ## 檔案結構
 
 ```
-├── uaf_rce.py               ← 純 HTTP 單漏洞 RCE（Heap UAF spray，618/619）
 ├── exploit_lfi.py           ← 純 HTTP 雙漏洞 RCE（OOM + LFI，619）
 ├── http_rce.py              ← 純 HTTP 雙漏洞 RCE（OOM + auto_prepend_file，619）
 ├── http_rce_default.py      ← 純 HTTP 雙漏洞 RCE（stock php.ini + .htaccess，619）
@@ -201,8 +199,5 @@ TARGET_HOST=10.0.0.1 TARGET_PORT=443 python3 test_oom.py
 - **CVE-2026-109619**：PHP Session Upload Progress OOM → session file preservation
   - stale 內層指標 `current_file_bytes_processed`（單檔分塊觸發）
   - 本 repo 的 OOM 路線（雙漏洞）和 GDB 路線皆基於此變體
-- **CVE-2026-109618**：PHP Session Upload Progress Heap UAF → RCE
-  - stale 外層指標 `post_bytes_processed`（多檔上傳觸發）
-  - `uaf_rce.py` 支援此變體（`--bug 618`，預設）
-- 兩者皆在 PHP 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 修補（2026-10-21）
+- 在 PHP 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 修補（2026-10-21）
 - PHP 7.x 無官方修補
