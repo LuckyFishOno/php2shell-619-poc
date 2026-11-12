@@ -33,7 +33,7 @@ file = (any data)
 PHP 8.x 的 session encode 有 `memchr` 保護阻擋 key 中的 `|`，需 binary patch 繞過。
 PHP 7.x 無此保護。
 
-技術細節 → [deser-inject.md](deser-inject.md)（中文）| [deser-inject-en.md](deser-inject-en.md)（English）
+技術細節 → [deser-inject.md](deser-inject.md)
 
 ---
 
@@ -113,7 +113,7 @@ python3 http_rce.py "uname -a; whoami"
 ```
 
 修改 `http_rce.py` 頂部設定 `TARGET`、`GADGET_CLASS` 等。
-技術細節 → [deser-inject.md](deser-inject.md) | [deser-inject-en.md](deser-inject-en.md)
+技術細節 → [deser-inject.md](deser-inject.md)
 
 ### OOM + LFI
 
@@ -165,8 +165,7 @@ Session 路徑因發行版不同：Debian/Ubuntu `/var/lib/php/sessions/`、Cent
 ├── test_oom.py              ← OOM 觸發測試
 ├── test_gdb.py              ← GDB 記憶體劫持 → RCE
 ├── README.md
-├── deser-inject.md          ← Deserialization Injection 技術細節（中文）
-├── deser-inject-en.md       ← Deserialization Injection technical details (English)
+├── deser-inject.md          ← Deserialization Injection 技術細節
 ├── oom-exploit.md           ← OOM 技術細節
 ├── gdb-exploit.md           ← GDB 路線技術細節
 ```
