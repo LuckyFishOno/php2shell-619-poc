@@ -103,8 +103,6 @@ OOM 觸發的必要條件：`post_max_size ≥ memory_limit`
 | `test_default_http.py` | OOM + auto_prepend | `.htaccess` 已放置，Apache AllowOverride All | `.htaccess` 覆蓋所有設定，stock php.ini 即可 |
 | `test_oom.py` | 僅 OOM 測試 | `post_max_size ≥ memory_limit` | 只驗證 OOM 是否觸發 |
 | `test_gdb.py` | GDB 記憶體劫持 | SSH + GDB + debug symbols | 單漏洞，詳見 [gdb-exploit.md](gdb-exploit.md) |
-| `uaf_rce.py` | Heap UAF spray | — | 實驗腳本（理論未驗證） |
-
 ## 使用方式
 
 ### Deserialization Injection（純 HTTP 單漏洞）
@@ -166,7 +164,6 @@ Session 路徑因發行版不同：Debian/Ubuntu `/var/lib/php/sessions/`、Cent
 ├── test_default_http.py     ← OOM + .htaccess → RCE（stock php.ini）
 ├── test_oom.py              ← OOM 觸發測試
 ├── test_gdb.py              ← GDB 記憶體劫持 → RCE
-├── uaf_rce.py               ← Heap UAF spray（理論未驗證）
 ├── README.md
 ├── deser-inject.md          ← Deserialization Injection 技術細節（中文）
 ├── deser-inject-en.md       ← Deserialization Injection technical details (English)
