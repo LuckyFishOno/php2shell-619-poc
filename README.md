@@ -97,7 +97,7 @@ OOM 觸發的必要條件：`post_max_size ≥ memory_limit`
 
 | 腳本 | 路線 | 前置條件 | 說明 |
 |------|------|----------|------|
-| **`http_rce.py`** | **Deser Injection** | **gadget class + memchr bypass** | **純 HTTP 單漏洞，單一請求 RCE** |
+| `http_rce.py` | Deser Injection | gadget class + memchr bypass | 純 HTTP 單漏洞，單一請求 RCE |
 | `php2shell.py` | OOM + LFI | 目標存在 LFI 漏洞 | 純 HTTP 雙漏洞，不需記憶體位址 |
 | `test_http.py` | OOM + auto_prepend | `.htaccess` 已放置，`post_max_size ≥ memory_limit` | `.htaccess` 設定 `auto_prepend_file` |
 | `test_default_http.py` | OOM + auto_prepend | `.htaccess` 已放置，Apache AllowOverride All | `.htaccess` 覆蓋所有設定，stock php.ini 即可 |
